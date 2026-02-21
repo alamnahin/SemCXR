@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -154,7 +155,7 @@ def get_device(local_rank: int = 0) -> torch.device:
     return torch.device("cpu")
 
 
-def setup_distributed(local_rank: int, world_size: int) -> bool:
+def setup_distributed(local_rank: int, world_size: int, rank: int) -> bool:
     """Setup distributed training."""
     if world_size <= 1:
         return False
@@ -164,7 +165,7 @@ def setup_distributed(local_rank: int, world_size: int) -> bool:
         backend="nccl",
         init_method="env://",
         world_size=world_size,
-        rank=local_rank
+        rank=rank
     )
     return True
 
@@ -173,6 +174,22 @@ def cleanup_distributed():
     """Cleanup distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def smart_load_state_dict(model: nn.Module, state_dict: Dict[str, torch.Tensor]):
+    """Load state dict across DDP/non-DDP wrappers."""
+    target_is_ddp = isinstance(model, DDP)
+    normalized_state_dict = {}
+
+    for key, value in state_dict.items():
+        if target_is_ddp and not key.startswith("module."):
+            normalized_state_dict[f"module.{key}"] = value
+        elif not target_is_ddp and key.startswith("module."):
+            normalized_state_dict[key.replace("module.", "", 1)] = value
+        else:
+            normalized_state_dict[key] = value
+
+    model.load_state_dict(normalized_state_dict, strict=False)
 
 
 # =============================================================================
@@ -201,8 +218,13 @@ class ChestXrayDataset(Dataset):
         self.is_training = is_training
         
         # Pre-tokenize text for efficiency
+        if 'Clean_Impression' in self.df.columns:
+            text_series = self.df['Clean_Impression'].fillna(self.df['Impression'])
+        else:
+            text_series = self.df['Impression']
+
         self.encodings = []
-        for text in self.df['Clean_Impression'].fillna(self.df['Impression']):
+        for text in text_series:
             encoding = self.tokenizer(
                 str(text),
                 max_length=max_length,
@@ -834,6 +856,9 @@ class Trainer:
         
         total_loss = 0.0
         num_batches = len(self.train_loader)
+
+        if self.is_distributed and isinstance(self.train_loader.sampler, DistributedSampler):
+            self.train_loader.sampler.set_epoch(self.current_epoch)
         
         for batch_idx, batch in enumerate(self.train_loader):
             # Move to device
@@ -869,12 +894,18 @@ class Trainer:
                         ignore_index=0
                     )
                     loss = loss + 0.5 * report_loss
+
+                loss_for_backward = loss / self.config.accumulate_grad_batches
             
             # Backward pass
-            self.scaler.scale(loss).backward()
+            self.scaler.scale(loss_for_backward).backward()
             
             # Gradient accumulation
-            if (batch_idx + 1) % self.config.accumulate_grad_batches == 0:
+            should_step = (
+                (batch_idx + 1) % self.config.accumulate_grad_batches == 0
+                or (batch_idx + 1) == num_batches
+            )
+            if should_step:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
@@ -1084,7 +1115,8 @@ def main():
     # Setup distributed
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
-    is_distributed = setup_distributed(local_rank, world_size) if world_size > 1 else False
+    global_rank = int(os.environ.get("RANK", local_rank))
+    is_distributed = setup_distributed(local_rank, world_size, global_rank) if world_size > 1 else False
     
     # Setup logging
     logger = setup_logging(local_rank)
@@ -1174,7 +1206,9 @@ def main():
     
     # Create sampler for class imbalance
     sampler = None
-    if config.use_weighted_sampler and not is_distributed:
+    if is_distributed:
+        sampler = DistributedSampler(train_dataset, shuffle=True)
+    elif config.use_weighted_sampler:
         class_counts = train_df['Category'].value_counts()
         class_weights = 1.0 / class_counts[train_df['Category']].values
         sampler = WeightedRandomSampler(class_weights, len(class_weights))
@@ -1213,8 +1247,8 @@ def main():
     )
     
     # Create scheduler
-    total_steps = len(train_loader) * config.num_epochs
-    warmup_steps = len(train_loader) * config.warmup_epochs
+    steps_per_epoch = (len(train_loader) + config.accumulate_grad_batches - 1) // config.accumulate_grad_batches
+    total_steps = max(1, steps_per_epoch * config.num_epochs)
     
     scheduler = OneCycleLR(
         optimizer,
@@ -1228,8 +1262,10 @@ def main():
     
     # Create loss
     if config.use_focal_loss:
-        class_counts = train_df['Category'].value_counts().sort_index().values
-        alpha = torch.tensor(1.0 / class_counts, dtype=torch.float32)
+        class_counts = train_df['Category'].value_counts()
+        counts_by_class = np.array([class_counts.get(name, 0) for name in ChestXrayDataset.CLASS_NAMES], dtype=np.float32)
+        inv = np.where(counts_by_class > 0, 1.0 / counts_by_class, 0.0)
+        alpha = torch.tensor(inv, dtype=torch.float32)
         alpha = alpha / alpha.sum()
         criterion = FocalLoss(alpha=alpha.to(device), gamma=config.focal_gamma)
     else:
@@ -1257,7 +1293,7 @@ def main():
     
     if args.resume_from:
         checkpoint = checkpoint_manager.load_checkpoint(args.resume_from)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        smart_load_state_dict(model, checkpoint['model_state_dict'])
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint:
