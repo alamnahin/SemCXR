@@ -1,0 +1,21 @@
+# Core scientific computing
+numpy
+pandas
+scikit-learn
+
+# Deep learning
+torch
+torchvision
+
+# Image processing
+Pillow
+
+# Transformers and vision models
+transformers
+timm
+
+# Testing
+pytest
+
+# Optional: for better progress bars and logging
+tqdm
