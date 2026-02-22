@@ -150,6 +150,30 @@ Results are saved to:
 - `results/semcxr_full/eval_fold0.json` - Metrics summary
 - `results/semcxr_full/predictions_fold0.csv` - Per-sample predictions
 
+### EDA (Dataset Profiling)
+
+Generate a compact dataset report (class distribution, missing values, text stats, image integrity, and plots):
+
+```bash
+python eda_report.py \
+  --csv data/data.csv \
+  --image_dir data/images \
+  --output_dir eda_reports \
+  --max_images 0
+```
+
+Notes:
+- `--max_images 0` checks all images; use a smaller number (e.g. `1000`) for faster smoke EDA.
+- If `matplotlib` is available, plot images are also generated.
+
+Typical outputs in `eda_reports/`:
+- `summary.json`
+- `class_distribution.csv`
+- `class_by_fold.csv` (when `fold` + `Category` exist)
+- `missing_values.csv`
+- `image_integrity_report.csv`
+- `class_distribution.png`, `class_by_fold.png`, `text_word_count_hist.png` (if plotting available)
+
 ### Testing
 
 Run unit tests:
@@ -202,6 +226,7 @@ SemCC/
 ├── train.py              # Main training script
 ├── evaluate.py           # Evaluation script
 ├── test.py               # Unit tests
+├── eda_report.py         # Dataset EDA/report generator
 ├── run_experiments.sh    # Cross-validation runner
 ├── requirements.txt      # Python dependencies
 ├── README.md            # This file
@@ -213,6 +238,7 @@ SemCC/
 │   ├── semcxr_full/
 │   ├── semcxr_no_report/
 │   └── semcxr_no_xattn/
+├── eda_reports/         # Generated EDA artifacts
 └── results/             # Evaluation outputs
     ├── semcxr_full/
     ├── semcxr_no_report/

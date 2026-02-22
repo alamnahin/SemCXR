@@ -17,7 +17,7 @@ import copy
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, classification_report, confusion_matrix
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 from PIL import Image
 
 import torch
@@ -1172,18 +1172,45 @@ def main():
     # Load data
     df = pd.read_csv(os.path.join(config.data_dir, config.csv_file))
     
-    # Stratified split
-    skf = StratifiedKFold(n_splits=config.num_folds, shuffle=True, random_state=config.seed)
-    splits = list(skf.split(df, df['Category']))
-    train_idx, val_idx = splits[config.fold]
-    
-    train_df = df.iloc[train_idx].copy()
-    val_df = df.iloc[val_idx].copy()
+    # Split strategy (prefer predefined fold to avoid leakage)
+    if 'fold' in df.columns:
+        available_folds = sorted(df['fold'].dropna().unique().tolist())
+        if config.fold not in available_folds:
+            raise ValueError(
+                f"Requested fold {config.fold} not in dataset fold column. "
+                f"Available folds: {available_folds}"
+            )
+
+        val_df = df[df['fold'] == config.fold].copy()
+        train_df = df[df['fold'] != config.fold].copy()
+        split_strategy = "precomputed_fold_column"
+    else:
+        if 'PatientID' in df.columns:
+            sgkf = StratifiedGroupKFold(
+                n_splits=config.num_folds,
+                shuffle=True,
+                random_state=config.seed
+            )
+            splits = list(sgkf.split(df, df['Category'], groups=df['PatientID']))
+            split_strategy = "stratified_group_kfold_patient"
+        else:
+            skf = StratifiedKFold(n_splits=config.num_folds, shuffle=True, random_state=config.seed)
+            splits = list(skf.split(df, df['Category']))
+            split_strategy = "stratified_kfold_rowwise"
+
+        train_idx, val_idx = splits[config.fold]
+        train_df = df.iloc[train_idx].copy()
+        val_df = df.iloc[val_idx].copy()
     
     if local_rank == 0:
+        logger.info(f"Split strategy: {split_strategy}")
         logger.info(f"Train size: {len(train_df)}, Val size: {len(val_df)}")
         logger.info(f"Train distribution: {train_df['Category'].value_counts().to_dict()}")
         logger.info(f"Val distribution: {val_df['Category'].value_counts().to_dict()}")
+
+        if 'PatientID' in train_df.columns and 'PatientID' in val_df.columns:
+            overlap = set(train_df['PatientID']).intersection(set(val_df['PatientID']))
+            logger.info(f"Patient overlap (train vs val): {len(overlap)}")
     
     # Create tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.text_encoder)

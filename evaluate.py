@@ -20,7 +20,7 @@ from sklearn.metrics import (
     roc_auc_score, accuracy_score, f1_score,
     classification_report, confusion_matrix
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 
 import torch
 import torch.nn.functional as F
@@ -169,11 +169,34 @@ def main():
     df = pd.read_csv(csv_path)
     print(f"Total samples: {len(df)}")
 
-    # Reproduce the same stratified split used during training
-    skf = StratifiedKFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
-    splits = list(skf.split(df, df['Category']))
-    _, val_idx = splits[args.fold]
-    val_df = df.iloc[val_idx].copy()
+    # Match training split strategy
+    if 'fold' in df.columns:
+        available_folds = sorted(df['fold'].dropna().unique().tolist())
+        if args.fold not in available_folds:
+            raise ValueError(
+                f"Requested fold {args.fold} not in dataset fold column. "
+                f"Available folds: {available_folds}"
+            )
+        val_df = df[df['fold'] == args.fold].copy()
+        split_strategy = "precomputed_fold_column"
+    else:
+        if 'PatientID' in df.columns:
+            sgkf = StratifiedGroupKFold(
+                n_splits=args.num_folds,
+                shuffle=True,
+                random_state=args.seed
+            )
+            splits = list(sgkf.split(df, df['Category'], groups=df['PatientID']))
+            split_strategy = "stratified_group_kfold_patient"
+        else:
+            skf = StratifiedKFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
+            splits = list(skf.split(df, df['Category']))
+            split_strategy = "stratified_kfold_rowwise"
+
+        _, val_idx = splits[args.fold]
+        val_df = df.iloc[val_idx].copy()
+
+    print(f"Split strategy: {split_strategy}")
     print(f"Fold {args.fold} validation size: {len(val_df)}")
     print(f"Distribution: {val_df['Category'].value_counts().to_dict()}")
 
