@@ -13,6 +13,7 @@ from typing import Dict, List, Tuple, Optional, Union, Callable
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 import copy
+import re
 
 import numpy as np
 import pandas as pd
@@ -83,6 +84,10 @@ class Config:
     use_focal_loss: bool = False
     focal_gamma: float = 2.0
     class_weights: Optional[List[float]] = None
+    use_noise_aware_loss: bool = False
+    noisy_sample_weight: float = 0.6
+    contrastive_weight: float = 0.0
+    consistency_weight: float = 0.0
     
     # Regularization
     use_swa: bool = True
@@ -152,6 +157,8 @@ def get_device(local_rank: int = 0) -> torch.device:
     """Get device for training."""
     if torch.cuda.is_available():
         return torch.device(f"cuda:{local_rank}")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -192,6 +199,72 @@ def smart_load_state_dict(model: nn.Module, state_dict: Dict[str, torch.Tensor])
     model.load_state_dict(normalized_state_dict, strict=False)
 
 
+def maybe_save_and_aggregate_fold_metrics(
+    config: Config,
+    fold: int,
+    metrics: Dict[str, float],
+    output_dir: str = "results"
+):
+    """Save per-fold best metrics and auto-aggregate cross-fold summary when possible."""
+    if not metrics:
+        return
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    fold_file = output_path / f"train_metrics_{config.experiment_name}_fold{fold}.json"
+    with open(fold_file, "w") as f:
+        json.dump({
+            "experiment_name": config.experiment_name,
+            "fold": fold,
+            **metrics
+        }, f, indent=2)
+
+    base_name = re.sub(r"_fold\d+$", "", config.experiment_name)
+    pattern = f"train_metrics_{base_name}_fold*_fold*.json"
+    # Also support names that do not include explicit fold in experiment_name.
+    candidates = list(output_path.glob(pattern))
+    candidates += list(output_path.glob(f"train_metrics_{base_name}_fold*.json"))
+    candidates = sorted(set(candidates))
+
+    if len(candidates) < config.num_folds:
+        return
+
+    records = []
+    for file in candidates:
+        try:
+            with open(file, "r") as f:
+                records.append(json.load(f))
+        except Exception:
+            continue
+
+    if len(records) < config.num_folds:
+        return
+
+    metric_keys = [
+        "Macro_AUC", "Accuracy", "F1_Macro", "F1_Weighted",
+        "AUC_Normal", "AUC_Pneumonia", "AUC_TB"
+    ]
+
+    summary = {
+        "experiment_base": base_name,
+        "num_folds": len(records),
+        "fold_files": [str(f) for f in candidates],
+        "per_fold": records,
+        "mean": {},
+        "std": {}
+    }
+
+    for key in metric_keys:
+        values = [r.get(key) for r in records if isinstance(r.get(key), (int, float))]
+        if values:
+            summary["mean"][key] = float(np.mean(values))
+            summary["std"][key] = float(np.std(values))
+
+    with open(output_path / f"train_cv_summary_{base_name}.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+
 # =============================================================================
 # Data
 # =============================================================================
@@ -200,6 +273,22 @@ class ChestXrayDataset(Dataset):
     """Chest X-ray dataset with multimodal support."""
     
     CLASS_NAMES = ["Normal", "Pneumonia", "TB"]
+    CATEGORY_ALIASES = {
+        "normal": "Normal",
+        "pneumonia": "Pneumonia",
+        "tb": "TB",
+        "tuberculosis": "TB",
+    }
+
+    @classmethod
+    def normalize_category(cls, category: Union[str, object]) -> str:
+        key = str(category).strip().lower()
+        normalized = cls.CATEGORY_ALIASES.get(key)
+        if normalized is None:
+            raise ValueError(
+                f"Unknown category '{category}'. Expected one of: {list(cls.CATEGORY_ALIASES.keys())}"
+            )
+        return normalized
     
     def __init__(
         self,
@@ -258,13 +347,19 @@ class ChestXrayDataset(Dataset):
         encoding = self.encodings[idx]
         
         # Get label
-        label = self.CLASS_NAMES.index(row['Category'])
+        normalized_category = self.normalize_category(row['Category'])
+        label = self.CLASS_NAMES.index(normalized_category)
+
+        original_category = row['Category_Original'] if 'Category_Original' in row.index else row['Category']
+        normalized_original = self.normalize_category(original_category)
+        is_clean = normalized_category == normalized_original
         
         return {
             'image': image,
             'input_ids': encoding['input_ids'],
             'attention_mask': encoding['attention_mask'],
             'label': torch.tensor(label, dtype=torch.long),
+            'is_clean': torch.tensor(is_clean, dtype=torch.bool),
             'image_id': row['Image']
         }
 
@@ -593,6 +688,9 @@ class SemCXR(nn.Module):
         logits = self.classifier(combined)
         
         outputs = {'logits': logits, 'features': combined}
+        outputs['img_features'] = img_feat
+        outputs['txt_features'] = txt_feat
+        outputs['fused_features'] = fused_feat
         
         # Report generation (if enabled and in training)
         if self.report_decoder is not None and report_targets is not None:
@@ -652,6 +750,50 @@ class LabelSmoothingCrossEntropy(nn.Module):
         nll_loss = F.nll_loss(logprobs, target, reduction='mean')
         smooth_loss = -logprobs.mean(dim=-1).mean()
         return confidence * nll_loss + self.smoothing * smooth_loss
+
+
+class NoiseAwareCrossEntropy(nn.Module):
+    """Downweights potentially noisy labels using Category vs Category_Original agreement."""
+
+    def __init__(self, noisy_weight: float = 0.6, smoothing: float = 0.1):
+        super().__init__()
+        self.noisy_weight = noisy_weight
+        self.smoothing = smoothing
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, is_clean: torch.Tensor) -> torch.Tensor:
+        n_classes = logits.size(-1)
+        with torch.no_grad():
+            smoothed = torch.full_like(logits, self.smoothing / max(1, n_classes - 1))
+            smoothed.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+
+        logprobs = F.log_softmax(logits, dim=-1)
+        per_sample = -(smoothed * logprobs).sum(dim=-1)
+        weights = torch.where(is_clean, torch.ones_like(per_sample), torch.full_like(per_sample, self.noisy_weight))
+        return (per_sample * weights).mean()
+
+
+class ContrastiveAlignmentLoss(nn.Module):
+    """Symmetric InfoNCE loss for image-text embedding alignment."""
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, img_feat: torch.Tensor, txt_feat: torch.Tensor) -> torch.Tensor:
+        img_feat = F.normalize(img_feat, dim=-1)
+        txt_feat = F.normalize(txt_feat, dim=-1)
+        logits = img_feat @ txt_feat.t() / self.temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        loss_i = F.cross_entropy(logits, labels)
+        loss_t = F.cross_entropy(logits.t(), labels)
+        return 0.5 * (loss_i + loss_t)
+
+
+class ConsistencyLoss(nn.Module):
+    """Feature-level consistency between image and text embeddings."""
+
+    def forward(self, img_feat: torch.Tensor, txt_feat: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(img_feat, txt_feat)
 
 
 # =============================================================================
@@ -816,7 +958,10 @@ class Trainer:
         self.world_size = world_size
 
         # AMP precision settings
-        if config.precision == "bf16-mixed":
+        if self.device.type != "cuda":
+            self.amp_enabled = False
+            self.amp_dtype = torch.float32
+        elif config.precision == "bf16-mixed":
             self.amp_enabled = True
             self.amp_dtype = torch.bfloat16
         elif config.precision == "16-mixed":
@@ -847,6 +992,12 @@ class Trainer:
         )
         
         self.metrics = MetricsCalculator(config.num_classes)
+        self.noise_aware_criterion = NoiseAwareCrossEntropy(
+            noisy_weight=config.noisy_sample_weight,
+            smoothing=config.label_smoothing
+        )
+        self.contrastive_criterion = ContrastiveAlignmentLoss()
+        self.consistency_criterion = ConsistencyLoss()
         self.current_epoch = 0
     
     def train_epoch(self) -> Dict[str, float]:
@@ -862,7 +1013,7 @@ class Trainer:
         
         for batch_idx, batch in enumerate(self.train_loader):
             # Move to device
-            for key in ['image', 'input_ids', 'attention_mask', 'label']:
+            for key in ['image', 'input_ids', 'attention_mask', 'label', 'is_clean']:
                 if key in batch:
                     batch[key] = batch[key].to(self.device)
             
@@ -884,7 +1035,18 @@ class Trainer:
                     # Mixup/Cutmix loss
                     loss = -(batch['target'] * F.log_softmax(outputs['logits'], dim=-1)).sum(dim=-1).mean()
                 else:
-                    loss = self.criterion(outputs['logits'], batch['label'])
+                    if self.config.use_noise_aware_loss and 'is_clean' in batch:
+                        loss = self.noise_aware_criterion(outputs['logits'], batch['label'], batch['is_clean'])
+                    else:
+                        loss = self.criterion(outputs['logits'], batch['label'])
+
+                if self.config.contrastive_weight > 0:
+                    contrastive_loss = self.contrastive_criterion(outputs['img_features'], outputs['txt_features'])
+                    loss = loss + self.config.contrastive_weight * contrastive_loss
+
+                if self.config.consistency_weight > 0:
+                    consistency_loss = self.consistency_criterion(outputs['img_features'], outputs['txt_features'])
+                    loss = loss + self.config.consistency_weight * consistency_loss
                 
                 # Report generation loss (if enabled)
                 if 'report_logits' in outputs:
@@ -977,9 +1139,12 @@ class Trainer:
     def fit(self, start_epoch: int = 0, max_epochs: int = None):
         """Main training loop."""
         max_epochs = max_epochs or self.config.num_epochs
+        best_metrics = None
+        last_epoch = start_epoch - 1
         
         for epoch in range(start_epoch, max_epochs):
             self.current_epoch = epoch
+            last_epoch = epoch
             
             # Train
             train_metrics = self.train_epoch()
@@ -1006,6 +1171,7 @@ class Trainer:
                 
                 if is_best:
                     self.best_score = score
+                    best_metrics = dict(val_metrics)
                     self.patience_counter = 0
                 else:
                     self.patience_counter += 1
@@ -1037,6 +1203,12 @@ class Trainer:
             torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, device=self.device)
             final_metrics = self.validate()
             self.logger.info(f"Final SWA Metrics: Macro AUC = {final_metrics['Macro_AUC']:.4f}")
+
+        return {
+            "best_score": float(self.best_score),
+            "best_metrics": best_metrics or {},
+            "last_epoch": last_epoch
+        }
 
 
 # =============================================================================
@@ -1083,10 +1255,14 @@ def parse_args():
     parser.add_argument("--no_weighted_sampler", action="store_true")
     parser.add_argument("--use_focal_loss", action="store_true")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
+    parser.add_argument("--use_noise_aware_loss", action="store_true")
+    parser.add_argument("--noisy_sample_weight", type=float, default=0.6)
     
     # Regularization
     parser.add_argument("--no_swa", action="store_true", help="Disable SWA")
     parser.add_argument("--swa_start", type=int, default=75)
+    parser.add_argument("--contrastive_weight", type=float, default=0.0)
+    parser.add_argument("--consistency_weight", type=float, default=0.0)
     
     # Checkpointing
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -1105,6 +1281,8 @@ def parse_args():
     # Reproducibility
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--save_fold_metrics", action="store_true",
+                       help="Save best fold metrics and auto-aggregate CV summary when available")
     
     return parser.parse_args()
 
@@ -1153,8 +1331,12 @@ def main():
         use_weighted_sampler=not args.no_weighted_sampler,
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
+        use_noise_aware_loss=args.use_noise_aware_loss,
+        noisy_sample_weight=args.noisy_sample_weight,
         use_swa=not args.no_swa,
         swa_start=args.swa_start,
+        contrastive_weight=args.contrastive_weight,
+        consistency_weight=args.consistency_weight,
         checkpoint_dir=args.checkpoint_dir,
         experiment_name=args.experiment_name,
         save_top_k=args.save_top_k,
@@ -1277,11 +1459,14 @@ def main():
     steps_per_epoch = (len(train_loader) + config.accumulate_grad_batches - 1) // config.accumulate_grad_batches
     total_steps = max(1, steps_per_epoch * config.num_epochs)
     
+    pct_start = config.warmup_epochs / max(1, config.num_epochs)
+    pct_start = float(min(max(pct_start, 0.0), 0.99))
+
     scheduler = OneCycleLR(
         optimizer,
         max_lr=config.lr,
         total_steps=total_steps,
-        pct_start=config.warmup_epochs / config.num_epochs,
+        pct_start=pct_start,
         anneal_strategy='cos',
         div_factor=25,
         final_div_factor=10000
@@ -1289,7 +1474,8 @@ def main():
     
     # Create loss
     if config.use_focal_loss:
-        class_counts = train_df['Category'].value_counts()
+        normalized_train_categories = train_df['Category'].apply(ChestXrayDataset.normalize_category)
+        class_counts = normalized_train_categories.value_counts()
         counts_by_class = np.array([class_counts.get(name, 0) for name in ChestXrayDataset.CLASS_NAMES], dtype=np.float32)
         inv = np.where(counts_by_class > 0, 1.0 / counts_by_class, 0.0)
         alpha = torch.tensor(inv, dtype=torch.float32)
@@ -1299,7 +1485,7 @@ def main():
         criterion = LabelSmoothingCrossEntropy(config.label_smoothing)
     
     # Create scaler (only needed for fp16, not bf16 or fp32)
-    scaler = GradScaler(enabled=config.precision == "16-mixed")
+    scaler = GradScaler(enabled=(config.precision == "16-mixed" and device.type == "cuda"))
     
     # Create checkpoint manager
     checkpoint_manager = CheckpointManager(
@@ -1350,7 +1536,15 @@ def main():
     )
     
     # Train
-    trainer.fit(start_epoch=start_epoch)
+    fit_result = trainer.fit(start_epoch=start_epoch)
+
+    if local_rank == 0 and args.save_fold_metrics:
+        maybe_save_and_aggregate_fold_metrics(
+            config=config,
+            fold=config.fold,
+            metrics=fit_result.get("best_metrics", {}),
+            output_dir="results"
+        )
     
     cleanup_distributed()
     logger.info("Training completed!")

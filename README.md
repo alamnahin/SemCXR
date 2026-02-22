@@ -8,7 +8,8 @@ A multimodal deep learning framework for chest X-ray classification combining im
 - **Cross-Modal Attention**: Optional attention mechanism for better image-text alignment
 - **Report Generation**: Optional decoder for generating radiology reports
 - **Advanced Training**: Mixed-precision training, SWA, gradient accumulation, mixup/cutmix augmentation
-- **Production-Ready**: Distributed training support, automatic checkpointing, comprehensive evaluation
+- **Research Objectives**: Optional noise-aware supervision, contrastive image-text alignment, and consistency regularization
+- **Production-Ready**: Distributed training support, leakage-safe split strategy, automatic checkpointing, comprehensive evaluation
 
 ## 📊 Results
 
@@ -104,6 +105,9 @@ data/
 - `Impression`: Raw radiology report text
 - `Clean_Impression`: Cleaned/preprocessed report text (optional, falls back to Impression)
 - `Category`: One of ["Normal", "Pneumonia", "TB"]
+- `Category_Original`: Optional original label to identify potentially noisy relabels
+- `fold`: Optional predefined fold assignment (preferred for leakage-safe CV)
+- `PatientID`: Optional patient identifier for grouped fallback split
 
 ### Training
 
@@ -131,6 +135,24 @@ bash run_experiments.sh
 # Override parameters
 FOLDS=5 NUM_EPOCHS=50 BATCH_SIZE=16 bash run_experiments.sh
 ```
+
+#### Publication-Focused Training (optional objectives)
+
+```bash
+python train.py \
+  --data_dir data \
+  --csv_file data.csv \
+  --image_dir data/images \
+  --fold 0 \
+  --experiment_name semcxr_pub_fold0 \
+  --use_noise_aware_loss \
+  --noisy_sample_weight 0.6 \
+  --contrastive_weight 0.1 \
+  --consistency_weight 0.05 \
+  --save_fold_metrics
+```
+
+This writes per-fold best metrics into `results/` and auto-generates a CV summary JSON once all folds are available.
 
 ### Evaluation
 
@@ -160,6 +182,12 @@ python eda_report.py \
   --image_dir data/images \
   --output_dir eda_reports \
   --max_images 0
+```
+
+Or use the helper script:
+
+```bash
+bash run_eda.sh
 ```
 
 Notes:
@@ -200,6 +228,11 @@ pytest test.py -v
 | `--use_swa` | True | Use Stochastic Weight Averaging |
 | `--swa_start` | 75 | Epoch to start SWA |
 | `--precision` | `16-mixed` | Mixed precision (`32`, `16-mixed`, `bf16-mixed`) |
+| `--use_noise_aware_loss` | False | Downweight potentially noisy samples using `Category_Original` |
+| `--noisy_sample_weight` | 0.6 | Weight for noisy samples when noise-aware loss is enabled |
+| `--contrastive_weight` | 0.0 | Weight for image-text contrastive alignment loss |
+| `--consistency_weight` | 0.0 | Weight for image-text consistency MSE loss |
+| `--save_fold_metrics` | False | Save fold-best metrics and aggregate CV summary in `results/` |
 
 ### Ablation Studies
 
@@ -227,6 +260,7 @@ SemCC/
 ├── evaluate.py           # Evaluation script
 ├── test.py               # Unit tests
 ├── eda_report.py         # Dataset EDA/report generator
+├── run_eda.sh            # One-command EDA helper script
 ├── run_experiments.sh    # Cross-validation runner
 ├── requirements.txt      # Python dependencies
 ├── README.md            # This file
@@ -257,14 +291,24 @@ torchrun --nproc_per_node=4 train.py \
   --image_dir data/images
 ```
 
+### Split Strategy (Train/Eval Consistency)
+
+Both `train.py` and `evaluate.py` use the same order:
+1. Use predefined `fold` column if present (preferred)
+2. Else use `StratifiedGroupKFold` with `PatientID` if available
+3. Else fallback to row-wise `StratifiedKFold`
+
 ### Resume Training
 
 ```bash
-# Auto-resume from last checkpoint
-python train.py --auto_resume
+# Auto-resume from last checkpoint (default behavior)
+python train.py
 
 # Resume from specific checkpoint
 python train.py --resume_from checkpoints/semcxr/last_model.pt
+
+# Disable auto-resume
+python train.py --no_auto_resume
 ```
 
 ### Custom Checkpoint Directory
@@ -299,20 +343,12 @@ python train.py \
 ### Class Imbalance Handling
 - Weighted random sampling
 - Optional focal loss
+- Optional noise-aware supervision (`Category` vs `Category_Original`)
 - Per-class AUC metrics
 
-## 🐛 Known Issues
-
-⚠️ **Important**: The following issues were identified during code review and should be addressed before production use:
-
-1. **Distributed Training**: `rank` parameter in `dist.init_process_group` should use global rank, not local rank
-2. **Data Sampling**: No `DistributedSampler` when using DDP, causing data overlap
-3. **Checkpoint Loading**: Resume doesn't handle `module.` prefix differences between DDP/non-DDP
-4. **LR Scheduling**: `OneCycleLR` total steps don't account for gradient accumulation
-5. **Dataset Robustness**: Hardcoded column names and class list (crashes on CSV variations)
-6. **Evaluation Loading**: Uses `strict=False` which can hide model mismatches
-
-See inline comments in `train.py` for detailed fix locations.
+### Additional Research Regularizers
+- Contrastive image-text alignment (InfoNCE-style)
+- Feature consistency regularization (MSE between image/text embeddings)
 
 ## 📊 Experiment Insights
 
