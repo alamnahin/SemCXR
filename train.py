@@ -601,7 +601,9 @@ class ReportDecoder(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         tgt_emb = self.embedding(tgt) + self.pos_encoding[:, :tgt.size(1)]
-        output = self.decoder(tgt_emb, memory.unsqueeze(1))
+        seq_len = tgt.size(1)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(tgt.device)
+        output = self.decoder(tgt_emb, memory.unsqueeze(1), tgt_mask=causal_mask)
         return self.output(output)
 
 
@@ -632,8 +634,8 @@ class SemCXR(nn.Module):
         
         # Classification head
         self.classifier = nn.Sequential(
-            nn.LayerNorm(config.embed_dim * 2),
-            nn.Linear(config.embed_dim * 2, config.embed_dim),
+            nn.LayerNorm(config.embed_dim),
+            nn.Linear(config.embed_dim, config.embed_dim),
             nn.GELU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.embed_dim, config.num_classes)
@@ -681,13 +683,10 @@ class SemCXR(nn.Module):
         else:
             fused_feat = img_feat
         
-        # Concatenate features
-        combined = torch.cat([fused_feat, txt_feat], dim=-1)
-        
-        # Classify
-        logits = self.classifier(combined)
-        
-        outputs = {'logits': logits, 'features': combined}
+        # Classify using pure image features to avoid text leakage at inference
+        logits = self.classifier(img_feat)
+
+        outputs = {'logits': logits, 'features': img_feat}
         outputs['img_features'] = img_feat
         outputs['txt_features'] = txt_feat
         outputs['fused_features'] = fused_feat
@@ -1457,9 +1456,11 @@ def main():
     
     # Create scheduler
     steps_per_epoch = (len(train_loader) + config.accumulate_grad_batches - 1) // config.accumulate_grad_batches
-    total_steps = max(1, steps_per_epoch * config.num_epochs)
+
+    active_epochs = config.swa_start if config.use_swa else config.num_epochs
+    total_steps = max(1, steps_per_epoch * active_epochs)
     
-    pct_start = config.warmup_epochs / max(1, config.num_epochs)
+    pct_start = config.warmup_epochs / max(1, active_epochs)
     pct_start = float(min(max(pct_start, 0.0), 0.99))
 
     scheduler = OneCycleLR(
